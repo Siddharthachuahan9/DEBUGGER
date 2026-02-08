@@ -15,6 +15,111 @@ type ProviderResponse = {
   tokensUsed: { input: number; output: number; total: number };
 };
 
+class ProviderError extends Error {
+  status: number;
+  provider: string;
+  retryable: boolean;
+  retryAfterMs: number | null;
+
+  constructor(
+    provider: string,
+    status: number,
+    rawBody: string
+  ) {
+    const message = parseErrorMessage(provider, status, rawBody);
+    super(message);
+    this.name = "ProviderError";
+    this.status = status;
+    this.provider = provider;
+    this.retryable = status === 429 || status === 503 || status >= 500;
+    this.retryAfterMs = extractRetryDelay(status, rawBody);
+  }
+}
+
+function parseErrorMessage(provider: string, status: number, rawBody: string): string {
+  // Rate limit
+  if (status === 429) {
+    const retryMatch = rawBody.match(/retry\s*(?:in|after)\s*([\d.]+)\s*s/i);
+    const retryHint = retryMatch
+      ? ` Try again in ${Math.ceil(parseFloat(retryMatch[1]))} seconds.`
+      : " Wait a moment and try again.";
+
+    if (/free.tier/i.test(rawBody) || /FreeTier/i.test(rawBody)) {
+      return `${provider} free tier quota exceeded.${retryHint} Upgrade your ${provider} plan or switch to a different provider.`;
+    }
+    return `${provider} rate limit reached.${retryHint}`;
+  }
+
+  // Auth errors
+  if (status === 401 || status === 403) {
+    return `${provider} API key is invalid or expired. Check your key in Settings.`;
+  }
+
+  // Not found (bad model)
+  if (status === 404) {
+    return `${provider} model not found. The selected model may be unavailable or the model ID is incorrect.`;
+  }
+
+  // Payment required
+  if (status === 402) {
+    return `${provider} account has insufficient credits. Add billing to your ${provider} account.`;
+  }
+
+  // Input too large
+  if (status === 413 || /too.large|token.limit|max.*length/i.test(rawBody)) {
+    return `Input too large for the selected ${provider} model. Try a shorter input or a model with a larger context window.`;
+  }
+
+  // Server errors
+  if (status >= 500) {
+    return `${provider} is experiencing issues (${status}). Try again or switch to a different provider.`;
+  }
+
+  // Try to extract a message field from JSON
+  try {
+    const parsed = JSON.parse(rawBody);
+    const msg =
+      parsed?.error?.message ??
+      parsed?.message ??
+      parsed?.error ??
+      null;
+    if (typeof msg === "string" && msg.length < 300) {
+      return `${provider} error: ${msg}`;
+    }
+  } catch {
+    // Not JSON
+  }
+
+  return `${provider} returned an error (${status}). Try again or switch providers.`;
+}
+
+function extractRetryDelay(status: number, rawBody: string): number | null {
+  if (status !== 429) return null;
+
+  // Check for "retry in Xs" pattern
+  const retryMatch = rawBody.match(/retry\s*(?:in|after)\s*([\d.]+)\s*s/i);
+  if (retryMatch) {
+    return Math.ceil(parseFloat(retryMatch[1])) * 1000;
+  }
+
+  // Check for retryDelay JSON field
+  try {
+    const parsed = JSON.parse(rawBody);
+    const delayStr =
+      parsed?.error?.details?.find?.(
+        (d: Record<string, string>) => d["@type"]?.includes("RetryInfo")
+      )?.retryDelay;
+    if (delayStr) {
+      const seconds = parseFloat(delayStr);
+      if (!isNaN(seconds)) return seconds * 1000;
+    }
+  } catch {
+    // Ignore parse failures
+  }
+
+  return 30000; // Default 30s for 429s without explicit delay
+}
+
 async function callOpenAI(
   config: ProviderConfig,
   messages: ChatMessage[]
@@ -34,8 +139,8 @@ async function callOpenAI(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`OpenAI API error: ${response.status} — ${error}`);
+    const body = await response.text();
+    throw new ProviderError("OpenAI", response.status, body);
   }
 
   const data = await response.json();
@@ -76,8 +181,8 @@ async function callAnthropic(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Anthropic API error: ${response.status} — ${error}`);
+    const body = await response.text();
+    throw new ProviderError("Anthropic", response.status, body);
   }
 
   const data = await response.json();
@@ -120,8 +225,8 @@ async function callGemini(
   );
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Gemini API error: ${response.status} — ${error}`);
+    const body = await response.text();
+    throw new ProviderError("Gemini", response.status, body);
   }
 
   const data = await response.json();
@@ -155,8 +260,8 @@ async function callGroq(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Groq API error: ${response.status} — ${error}`);
+    const body = await response.text();
+    throw new ProviderError("Groq", response.status, body);
   }
 
   const data = await response.json();
@@ -188,8 +293,8 @@ async function callOpenRouter(
   });
 
   if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`OpenRouter API error: ${response.status} — ${error}`);
+    const body = await response.text();
+    throw new ProviderError("OpenRouter", response.status, body);
   }
 
   const data = await response.json();
@@ -219,11 +324,14 @@ export async function callProvider(
   const handler = PROVIDER_MAP[provider];
   if (!handler) throw new Error(`Unsupported provider: ${provider}`);
 
-  // Retry once on failure
   try {
     return await handler(config, messages);
   } catch (error) {
-    // Single retry
-    return await handler(config, messages);
+    // Only retry on server errors (5xx). Never retry 4xx (rate limits, auth, bad input).
+    if (error instanceof ProviderError && error.status >= 500) {
+      await new Promise((r) => setTimeout(r, 2000));
+      return await handler(config, messages);
+    }
+    throw error;
   }
 }
