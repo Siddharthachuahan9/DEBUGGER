@@ -32,8 +32,8 @@ export const MODELS: AIModel[] = [
     tier: "pro",
   },
   {
-    id: "gemini-2.0-flash",
-    name: "Gemini 2.0 Flash",
+    id: "gemini-2.5-flash",
+    name: "Gemini 2.5 Flash",
     provider: "gemini",
     description: "Fast and free-tier friendly. Good for quick checks.",
     costPer1kInput: 0.0001,
